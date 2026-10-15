@@ -10,14 +10,17 @@ on:
           - Debug
           - Release
         default: Debug
+        required: true
       publish:
         description: Publish a GitHub release
         type: boolean
         default: false
+        required: true
       tag:
         description: Release tag
         type: string
         default: v1.0
+        required: true
 
 permissions:
   contents: write
@@ -28,7 +31,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Moix APK
+    name: Build Moix Kernel Manager
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -37,7 +40,7 @@ jobs:
         working-directory: AppSource
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -53,54 +56,121 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Diagnose Android SDK
+        shell: bash
         run: |
-          sdkmanager --licenses
-          sdkmanager \
+          set -u
+          echo "ANDROID_HOME=${ANDROID_HOME:-not-set}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-not-set}"
+          java -version
+
+          SDKMANAGER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null | head -n 1)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager tidak ditemukan"
+            exit 1
+          fi
+
+          echo "sdkmanager=$SDKMANAGER"
+          "$SDKMANAGER" --version
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK root tidak ditemukan"
+            exit 1
+          fi
+
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null | head -n 1)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager tidak ditemukan"
+            exit 1
+          fi
+
+          set +e
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
+          set -e
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-      - name: Check project structure
+      - name: Validate Gradle project
+        shell: bash
         run: |
-          echo "===== Gradle files ====="
-          test -f settings.gradle.kts
-          test -f gradlew
-          chmod +x gradlew
-          cat settings.gradle.kts
+          set -euo pipefail
 
-      - name: Build Debug APK
-        if: ${{ inputs.build_type == 'Debug' }}
-        run: ./gradlew assembleDebug --stacktrace
+          pwd
+          ls -la
 
-      - name: Build Release APK
-        if: ${{ inputs.build_type == 'Release' }}
-        run: ./gradlew assembleRelease --stacktrace
-
-      - name: Find APK
-        id: apk
-        run: |
-          APK="$(find app/build/outputs/apk \
-            -type f -name '*.apk' \
-            ! -name '*androidTest*' | head -n 1)"
-
-          if [ -z "$APK" ]; then
-            echo "::error::APK tidak ditemukan di app/build/outputs/apk"
-            find app/build/outputs -maxdepth 5 -type f 2>/dev/null || true
+          if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
+            echo "::error::Gradle settings file tidak ditemukan"
             exit 1
           fi
 
-          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          if [ ! -f gradlew ]; then
+            echo "::error::Gradle wrapper tidak ditemukan"
+            exit 1
+          fi
+
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build Debug APK
+        if: ${{ inputs.build_type == 'Debug' }}
+        shell: bash
+        run: ./gradlew --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Build Release APK
+        if: ${{ inputs.build_type == 'Release' }}
+        shell: bash
+        run: ./gradlew --no-daemon :app:assembleRelease --stacktrace
+
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find app/build/outputs/apk \
+            -type f -name '*.apk' \
+            ! -path '*/androidTest/*' \
+            | sort | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan"
+            find app/build/outputs -type f 2>/dev/null || true
+            exit 1
+          fi
+
           echo "APK ditemukan: $APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
 
       - name: Generate SHA256
-        if: ${{ success() }}
-        run: sha256sum "${{ steps.apk.outputs.path }}" > "${{ steps.apk.outputs.path }}.sha256"
+        shell: bash
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          sha256sum "$APK_PATH" > "$APK_PATH.sha256"
+          cat "$APK_PATH.sha256"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: moix-kernel-manager-${{ inputs.build_type }}-${{ github.run_number }}
+          name: Moix-Kernel-Manager-${{ inputs.build_type }}-${{ github.run_number }}
           path: |
             AppSource/${{ steps.apk.outputs.path }}
             AppSource/${{ steps.apk.outputs.path }}.sha256
@@ -109,24 +179,33 @@ jobs:
 
       - name: Publish GitHub Release
         if: ${{ inputs.publish && inputs.build_type == 'Release' }}
+        working-directory: .
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           APK_PATH: ${{ steps.apk.outputs.path }}
+        shell: bash
         run: |
-          cd "$GITHUB_WORKSPACE/AppSource"
+          set -euo pipefail
 
           if [ -z "$TAG" ]; then
-            echo "::error::Tag release tidak boleh kosong"
+            echo "::error::Release tag tidak boleh kosong"
             exit 1
           fi
 
-          sha256sum "$APK_PATH" > "$APK_PATH.sha256"
+          FULL_APK_PATH="$GITHUB_WORKSPACE/AppSource/$APK_PATH"
+
+          if [ ! -f "$FULL_APK_PATH" ]; then
+            echo "::error::APK tidak ditemukan: $FULL_APK_PATH"
+            exit 1
+          fi
+
+          sha256sum "$FULL_APK_PATH" > "$FULL_APK_PATH.sha256"
 
           gh release create "$TAG" \
-            "$APK_PATH" \
-            "$APK_PATH.sha256" \
+            "$FULL_APK_PATH" \
+            "$FULL_APK_PATH.sha256" \
             --target "$GITHUB_SHA" \
             --title "Moix Kernel Manager $TAG" \
-            --notes "Moix Kernel Manager build $TAG"
+            --notes "Moix Kernel Manager $TAG build"
