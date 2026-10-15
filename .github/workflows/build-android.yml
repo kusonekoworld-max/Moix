@@ -1,0 +1,61 @@
+name: Build Moix Kernel Manager
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: AppSource
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-37" \
+            "cmake;3.22.1"
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Validate Gradle wrapper
+        run: ./gradlew --version
+
+      - name: Build debug and release APKs
+        run: ./gradlew --no-daemon --stacktrace assembleDebug assembleRelease
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: moix-kernel-manager-apks
+          path: |
+            AppSource/app/build/outputs/apk/debug/*.apk
+            AppSource/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
