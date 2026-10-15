@@ -1,61 +1,132 @@
 name: Build Moix Kernel Manager
 
 on:
-  push:
-    branches: ["main", "master"]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: Build type
+        type: choice
+        options:
+          - Debug
+          - Release
+        default: Debug
+      publish:
+        description: Publish a GitHub release
+        type: boolean
+        default: false
+      tag:
+        description: Release tag
+        type: string
+        default: v1.0
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: android-build-${{ github.ref }}
+  group: moix-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build APKs
+    name: Build Moix APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
+
     defaults:
       run:
         working-directory: AppSource
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
+          cache: gradle
 
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK components
+      - name: Install Android SDK packages
         run: |
-          sdkmanager --install \
+          sdkmanager --licenses
+          sdkmanager \
             "platform-tools" \
-            "platforms;android-37" \
-            "cmake;3.22.1"
+            "platforms;android-36" \
+            "build-tools;36.0.0"
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
+      - name: Check project structure
+        run: |
+          echo "===== Gradle files ====="
+          test -f settings.gradle.kts
+          test -f gradlew
+          chmod +x gradlew
+          cat settings.gradle.kts
 
-      - name: Validate Gradle wrapper
-        run: ./gradlew --version
+      - name: Build Debug APK
+        if: ${{ inputs.build_type == 'Debug' }}
+        run: ./gradlew assembleDebug --stacktrace
 
-      - name: Build debug and release APKs
-        run: ./gradlew --no-daemon --stacktrace assembleDebug assembleRelease
+      - name: Build Release APK
+        if: ${{ inputs.build_type == 'Release' }}
+        run: ./gradlew assembleRelease --stacktrace
 
-      - name: Upload APK artifacts
+      - name: Find APK
+        id: apk
+        run: |
+          APK="$(find app/build/outputs/apk \
+            -type f -name '*.apk' \
+            ! -name '*androidTest*' | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan di app/build/outputs/apk"
+            find app/build/outputs -maxdepth 5 -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "APK ditemukan: $APK"
+
+      - name: Generate SHA256
+        if: ${{ success() }}
+        run: sha256sum "${{ steps.apk.outputs.path }}" > "${{ steps.apk.outputs.path }}.sha256"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: moix-kernel-manager-apks
+          name: moix-kernel-manager-${{ inputs.build_type }}-${{ github.run_number }}
           path: |
-            AppSource/app/build/outputs/apk/debug/*.apk
-            AppSource/app/build/outputs/apk/release/*.apk
+            AppSource/${{ steps.apk.outputs.path }}
+            AppSource/${{ steps.apk.outputs.path }}.sha256
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish && inputs.build_type == 'Release' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          cd "$GITHUB_WORKSPACE/AppSource"
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Tag release tidak boleh kosong"
+            exit 1
+          fi
+
+          sha256sum "$APK_PATH" > "$APK_PATH.sha256"
+
+          gh release create "$TAG" \
+            "$APK_PATH" \
+            "$APK_PATH.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "Moix Kernel Manager $TAG" \
+            --notes "Moix Kernel Manager build $TAG"
