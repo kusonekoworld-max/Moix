@@ -55,52 +55,36 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Diagnose Android SDK
-        shell: bash
-        run: |
-          set -u
-          echo "ANDROID_HOME=${ANDROID_HOME:-not-set}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-not-set}"
-          java -version
-
-          SDKMANAGER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" \
-            -type f -name sdkmanager 2>/dev/null | head -n 1)"
-
-          if [ -z "$SDKMANAGER" ]; then
-            echo "::error::sdkmanager tidak ditemukan"
-            exit 1
-          fi
-
-          echo "sdkmanager=$SDKMANAGER"
-          "$SDKMANAGER" --version
+        with:
+          packages: ''
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
 
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-
-          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
-            echo "::error::Android SDK root tidak ditemukan"
-            exit 1
-          fi
-
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           export ANDROID_HOME="$SDK_ROOT"
           export ANDROID_SDK_ROOT="$SDK_ROOT"
 
-          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" \
-            -type f -name sdkmanager 2>/dev/null | head -n 1)"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager"
 
-          if [ -z "$SDKMANAGER" ]; then
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+              -type f -name sdkmanager 2>/dev/null | head -n 1)"
+          fi
+
+          if [ -z "${SDKMANAGER:-}" ] || [ ! -x "$SDKMANAGER" ]; then
             echo "::error::sdkmanager tidak ditemukan"
             exit 1
           fi
 
-          set +e
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
-          set -e
+          echo "SDK root: $SDK_ROOT"
+          echo "sdkmanager: $SDKMANAGER"
+          java -version
+          "$SDKMANAGER" --version
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses || true
 
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platform-tools" \
@@ -112,21 +96,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          pwd
-          ls -la
+          test -f gradlew || {
+            echo "::error::Gradle wrapper tidak ditemukan"
+            exit 1
+          }
 
           if [ ! -f settings.gradle.kts ] && [ ! -f settings.gradle ]; then
-            echo "::error::Gradle settings file tidak ditemukan"
-            exit 1
-          fi
-
-          if [ ! -f gradlew ]; then
-            echo "::error::Gradle wrapper tidak ditemukan"
+            echo "::error::Gradle settings tidak ditemukan"
             exit 1
           fi
 
           chmod +x gradlew
           ./gradlew --version
+
+      - name: Show Gradle modules
+        shell: bash
+        run: ./gradlew projects --stacktrace
 
       - name: Build Debug APK
         if: ${{ inputs.build_type == 'Debug' }}
@@ -155,17 +140,14 @@ jobs:
             exit 1
           fi
 
-          echo "APK ditemukan: $APK"
           echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "APK ditemukan: $APK"
 
       - name: Generate SHA256
         shell: bash
         env:
           APK_PATH: ${{ steps.apk.outputs.path }}
-        run: |
-          set -euo pipefail
-          sha256sum "$APK_PATH" > "$APK_PATH.sha256"
-          cat "$APK_PATH.sha256"
+        run: sha256sum "$APK_PATH" > "$APK_PATH.sha256"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -189,15 +171,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "$TAG" ]; then
-            echo "::error::Release tag tidak boleh kosong"
-            exit 1
-          fi
-
           FULL_APK_PATH="$GITHUB_WORKSPACE/AppSource/$APK_PATH"
 
-          if [ ! -f "$FULL_APK_PATH" ]; then
-            echo "::error::APK tidak ditemukan: $FULL_APK_PATH"
+          if [ -z "$TAG" ] || [ ! -f "$FULL_APK_PATH" ]; then
+            echo "::error::Tag kosong atau APK tidak ditemukan"
             exit 1
           fi
 
